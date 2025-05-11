@@ -1,8 +1,10 @@
-const WebSocket = require('ws');
+const { createServer } = require('http');
+const { Server } = require('socket.io');
 const path = require('path');
 const fs = require('fs');
 
-const PORT = 3002;
+// Usar el puerto 8080 para Digital Ocean App Platform o 3002 para desarrollo local
+const PORT = process.env.PORT || 8080;
 const RECONNECTION_WINDOW = 10000;
 const MESSAGE_STATUS = {
   SENT: 'sent',
@@ -17,8 +19,16 @@ const roomMessages = new Map();
 const roomParticipants = new Map();
 const userJoinTimestamps = new Map();
 
-const wss = new WebSocket.Server({ port: PORT });
-console.log(`Servidor WebSocket iniciado en el puerto ${PORT}`);
+// Crear servidor HTTP y Socket.IO
+const httpServer = createServer();
+const io = new Server(httpServer, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
+console.log(`Servidor Socket.IO iniciado en el puerto ${PORT}`);
 
 function getRoomIfExists(roomCode) {
   return rooms.get(roomCode);
@@ -85,8 +95,8 @@ function cleanupEmptyRoom(roomCode) {
   }
 }
 
-function getUserDisplayName(message) {
-  return message.displayName || message.userName.split('_')[0];
+function getUserDisplayName(messageData) {
+  return messageData.displayName || messageData.userName.split('_')[0];
 }
 
 function trackUserConnection(roomCode, displayName) {
@@ -161,16 +171,7 @@ function createChatMessage(roomCode, sender, content) {
 function broadcastToRoom(roomCode, messageObj) {
   if (!rooms.has(roomCode)) return;
   
-  const room = rooms.get(roomCode);
-  const messageString = JSON.stringify(messageObj);
-  
-  room.users.forEach(userInfo => {
-    userInfo.sockets.forEach(socket => {
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(messageString);
-      }
-    });
-  });
+  io.to(roomCode).emit(messageObj.type, messageObj);
 }
 
 function sendRecentMessageHistory(socket, roomCode, displayName) {
@@ -191,11 +192,11 @@ function sendRecentMessageHistory(socket, roomCode, displayName) {
   
   if (relevantMessages.length > 0) {
     console.log(`Enviando ${relevantMessages.length} mensajes del historial a ${displayName} (desde ${new Date(userJoinTime).toLocaleString()})`);
-    socket.send(JSON.stringify({
+    socket.emit('messageHistory', {
       type: 'messageHistory',
       roomCode,
       messages: relevantMessages
-    }));
+    });
   } else {
     console.log(`No hay mensajes relevantes para enviar a ${displayName} (se unió en ${new Date(userJoinTime).toLocaleString()})`);
   }
@@ -241,7 +242,7 @@ function updateUserList(roomCode) {
   
   console.log(`Actualizando lista de usuarios en sala ${roomCode}: ${userList.map(u => u.name).join(', ')}`);
   
-  broadcastToRoom(roomCode, {
+  io.to(roomCode).emit('userList', {
     type: 'userList',
     roomCode,
     count: room.userCount,
@@ -250,229 +251,241 @@ function updateUserList(roomCode) {
   });
 }
 
-function broadcastTypingStatus(roomCode, userName, isTyping) {
-  broadcastToRoom(roomCode, {
-    type: 'typingStatus',
-    roomCode,
-    userName,
-    isTyping
-  });
-}
+// Configuración de Socket.IO con manejadores de eventos
+io.on('connection', (socket) => {
+  console.log('Cliente conectado');
+  
+  const socketState = {
+    currentRoom: null,
+    currentUser: null,
+    typingTimeout: null
+  };
 
-function handleJoinRoom(socket, message, socketState) {
-  const roomCode = message.roomCode;
-  const userName = message.userName;
-  const displayName = getUserDisplayName(message);
-  
-  const salaExistente = rooms.has(roomCode);
-  
-  if (!salaExistente) {
-    const isFirstRoomCreator = !roomParticipants.has(roomCode);
+  // Evento para unirse a una sala
+  socket.on('joinRoom', (message) => {
+    const roomCode = message.roomCode;
+    const userName = message.userName;
+    const displayName = getUserDisplayName(message);
     
-    if (isFirstRoomCreator) {
-      console.log(`Usuario ${displayName} está creando nueva sala ${roomCode}`);
-    } else {
-      socket.send(JSON.stringify({
-        type: 'error',
-        message: `La sala ${roomCode} ya no existe o ha sido cerrada.`
-      }));
-      console.log(`Intento fallido de unirse a sala inexistente ${roomCode} por usuario ${displayName}`);
-      return;
-    }
-  }
-  
-  const reconnectionKey = `${displayName}_${roomCode}`;
-  const lastDisconnection = recentDisconnections.get(reconnectionKey);
-  const isReconnection = lastDisconnection && (Date.now() - lastDisconnection < RECONNECTION_WINDOW);
-  
-  if (isReconnection) {
-    console.log(`Reconexión detectada para ${displayName}`);
-    recentDisconnections.delete(reconnectionKey);
-  }
-  
-  if (socketState.currentRoom && socketState.currentRoom !== roomCode) {
-    handleLeaveRoom(socket, {
-      type: 'leaveRoom',
-      roomCode: socketState.currentRoom,
-      userName: socketState.currentUser,
-      displayName
-    }, false, socketState);
-  }
-  
-  socketState.currentRoom = roomCode;
-  socketState.currentUser = userName;
-  socket.displayName = displayName;
-  
-  if (!rooms.has(roomCode)) {
-    createRoom(roomCode);
-  }
-  
-  if (!roomMessages.has(roomCode)) {
-    roomMessages.set(roomCode, []);
-  }
-  
-  if (!roomParticipants.has(roomCode)) {
-    roomParticipants.set(roomCode, new Map());
-  }
-  
-  const { isFirstTimeJoining, hadLeftVoluntarily } = trackUserConnection(roomCode, displayName);
-  
-  if (!roomParticipants.get(roomCode).has(displayName)) {
-    roomParticipants.get(roomCode).set(displayName, {
-      name: displayName,
-      status: "activo",
-      connected: true,
-      lastSeen: Date.now(),
-      joinedAt: userJoinTimestamps.get(`${displayName}_${roomCode}`) || Date.now()
-    });
-  } else {
-    const userInfo = roomParticipants.get(roomCode).get(displayName);
-    userInfo.connected = true;
-    userInfo.status = "activo";
-    userInfo.lastSeen = Date.now();
-  }
-  
-  const room = rooms.get(roomCode);
-  let isNewUser = false;
-  
-  if (!room.users.has(displayName)) {
-    room.users.set(displayName, {
-      sockets: new Set(),
-      status: "activo",
-      typing: false,
-      connected: true,
-      lastActivity: Date.now()
-    });
-    room.userCount++;
-    isNewUser = true;
-  } else {
-    const userInfo = room.users.get(displayName);
-    userInfo.connected = true;
-    userInfo.status = "activo";
-    userInfo.lastActivity = Date.now();
-  }
-  
-  room.users.get(displayName).sockets.add(socket);
-  
-  console.log(`Usuario ${displayName} agregado a sala ${roomCode} (total: ${room.userCount})`);
-  
-  if ((isNewUser && !isReconnection) || hadLeftVoluntarily) {
-    const joinNotification = `${displayName} ha ingresado a la sala.`;
-    const timestamp = addNotificationToHistory(roomCode, joinNotification);
+    const salaExistente = rooms.has(roomCode);
     
-    broadcastToRoom(roomCode, {
-      type: 'message',
-      roomCode: roomCode,
-      message: joinNotification,
-      timestamp: timestamp || Date.now()
-    });
-    
-    console.log(`Notificación enviada: ${joinNotification}`);
-  }
-  
-  updateUserList(roomCode);
-  sendRecentMessageHistory(socket, roomCode, displayName);
-}
-
-function handleLeaveRoom(socket, message, isVoluntary, socketState) {
-  if (!message.roomCode) return;
-  
-  const roomCode = message.roomCode;
-  const displayName = getUserDisplayName(message);
-  
-  if (rooms.has(roomCode)) {
-    const room = rooms.get(roomCode);
-    
-    if (room.users.has(displayName)) {
-      const userInfo = room.users.get(displayName);
-      userInfo.sockets.delete(socket);
+    if (!salaExistente) {
+      const isFirstRoomCreator = !roomParticipants.has(roomCode);
       
-      if (userInfo.sockets.size === 0) {
-        if (isVoluntary) {
-          removeUserFromRoom(roomCode, displayName, true);
-          
-          broadcastToRoom(roomCode, {
-            type: 'message',
-            roomCode,
-            message: `${displayName} ha abandonado la sala.`,
-            timestamp: Date.now()
-          });
-        } else {
+      if (isFirstRoomCreator) {
+        console.log(`Usuario ${displayName} está creando nueva sala ${roomCode}`);
+      } else {
+        socket.emit('error', {
+          type: 'error',
+          message: `La sala ${roomCode} ya no existe o ha sido cerrada.`
+        });
+        console.log(`Intento fallido de unirse a sala inexistente ${roomCode} por usuario ${displayName}`);
+        return;
+      }
+    }
+    
+    const reconnectionKey = `${displayName}_${roomCode}`;
+    const lastDisconnection = recentDisconnections.get(reconnectionKey);
+    const isReconnection = lastDisconnection && (Date.now() - lastDisconnection < RECONNECTION_WINDOW);
+    
+    if (isReconnection) {
+      console.log(`Reconexión detectada para ${displayName}`);
+      recentDisconnections.delete(reconnectionKey);
+    }
+    
+    if (socketState.currentRoom && socketState.currentRoom !== roomCode) {
+      // Dejar sala anterior si existe
+      socket.leave(socketState.currentRoom);
+      
+      if (rooms.has(socketState.currentRoom)) {
+        const room = rooms.get(socketState.currentRoom);
+        
+        if (room.users.has(displayName)) {
+          const userInfo = room.users.get(displayName);
           userInfo.connected = false;
           userInfo.lastActivity = Date.now();
-          console.log(`Usuario ${displayName} desconectado temporalmente`);
           
-          if (roomParticipants.has(roomCode) && roomParticipants.get(roomCode).has(displayName)) {
-            const participant = roomParticipants.get(roomCode).get(displayName);
+          if (roomParticipants.has(socketState.currentRoom) && roomParticipants.get(socketState.currentRoom).has(displayName)) {
+            const participant = roomParticipants.get(socketState.currentRoom).get(displayName);
             participant.connected = false;
             participant.status = "desconectado";
             participant.lastSeen = Date.now();
           }
+          
+          updateUserList(socketState.currentRoom);
         }
+      }
+    }
+    
+    // Unirse a la nueva sala en Socket.IO
+    socket.join(roomCode);
+    
+    socketState.currentRoom = roomCode;
+    socketState.currentUser = userName;
+    socket.displayName = displayName;
+    
+    if (!rooms.has(roomCode)) {
+      createRoom(roomCode);
+    }
+    
+    if (!roomMessages.has(roomCode)) {
+      roomMessages.set(roomCode, []);
+    }
+    
+    if (!roomParticipants.has(roomCode)) {
+      roomParticipants.set(roomCode, new Map());
+    }
+    
+    const { isFirstTimeJoining, hadLeftVoluntarily } = trackUserConnection(roomCode, displayName);
+    
+    if (!roomParticipants.get(roomCode).has(displayName)) {
+      roomParticipants.get(roomCode).set(displayName, {
+        name: displayName,
+        status: "activo",
+        connected: true,
+        lastSeen: Date.now(),
+        joinedAt: userJoinTimestamps.get(`${displayName}_${roomCode}`) || Date.now(),
+        socketId: socket.id
+      });
+    } else {
+      const userInfo = roomParticipants.get(roomCode).get(displayName);
+      userInfo.connected = true;
+      userInfo.status = "activo";
+      userInfo.lastSeen = Date.now();
+      userInfo.socketId = socket.id;
+    }
+    
+    const room = rooms.get(roomCode);
+    let isNewUser = false;
+    
+    if (!room.users.has(displayName)) {
+      room.users.set(displayName, {
+        socketId: socket.id,
+        status: "activo",
+        typing: false,
+        connected: true,
+        lastActivity: Date.now()
+      });
+      room.userCount++;
+      isNewUser = true;
+    } else {
+      const userInfo = room.users.get(displayName);
+      userInfo.connected = true;
+      userInfo.status = "activo";
+      userInfo.lastActivity = Date.now();
+      userInfo.socketId = socket.id;
+    }
+    
+    console.log(`Usuario ${displayName} agregado a sala ${roomCode} (total: ${room.userCount})`);
+    
+    if ((isNewUser && !isReconnection) || hadLeftVoluntarily) {
+      const joinNotification = `${displayName} ha ingresado a la sala.`;
+      const timestamp = addNotificationToHistory(roomCode, joinNotification);
+      
+      io.to(roomCode).emit('message', {
+        type: 'message',
+        roomCode: roomCode,
+        message: joinNotification,
+        timestamp: timestamp || Date.now()
+      });
+      
+      console.log(`Notificación enviada: ${joinNotification}`);
+    }
+    
+    updateUserList(roomCode);
+    sendRecentMessageHistory(socket, roomCode, displayName);
+  });
+
+  // Evento para enviar mensajes
+  socket.on('sendMessage', (message) => {
+    if (!socketState.currentRoom || !socketState.currentUser) return;
+    
+    if (message.roomCode === socketState.currentRoom) {
+      const senderDisplayName = getUserDisplayName(message);
+      
+      updateUserStatus(socketState.currentRoom, senderDisplayName, "activo");
+      
+      if (socketState.typingTimeout) {
+        clearTimeout(socketState.typingTimeout);
+        socketState.typingTimeout = null;
+      }
+      
+      const room = rooms.get(socketState.currentRoom);
+      if (room && room.users.has(senderDisplayName)) {
+        room.users.get(senderDisplayName).typing = false;
+        io.to(socketState.currentRoom).emit('typingStatus', {
+          roomCode: socketState.currentRoom,
+          userName: senderDisplayName,
+          isTyping: false
+        });
+      }
+      
+      const { messageId, timestamp, formattedMessage } = createChatMessage(
+        socketState.currentRoom, 
+        senderDisplayName, 
+        message.message
+      );
+      
+      io.to(socketState.currentRoom).emit('message', {
+        type: 'message',
+        id: messageId,
+        roomCode: socketState.currentRoom,
+        sender: senderDisplayName,
+        timestamp,
+        status: MESSAGE_STATUS.DELIVERED,
+        message: formattedMessage
+      });
+    }
+  });
+
+  // Evento para salir de una sala
+  socket.on('leaveRoom', (message) => {
+    if (!message.roomCode) return;
+    
+    const roomCode = message.roomCode;
+    const displayName = getUserDisplayName(message);
+    
+    // Dejar la sala en Socket.IO
+    socket.leave(roomCode);
+    
+    if (rooms.has(roomCode)) {
+      const room = rooms.get(roomCode);
+      
+      if (room.users.has(displayName)) {
+        removeUserFromRoom(roomCode, displayName, true);
+        
+        io.to(roomCode).emit('message', {
+          type: 'message',
+          roomCode,
+          message: `${displayName} ha abandonado la sala.`,
+          timestamp: Date.now()
+        });
         
         updateUserList(roomCode);
         cleanupEmptyRoom(roomCode);
       }
     }
-  }
-  
-  if (socketState.currentRoom === roomCode) {
-    socketState.currentRoom = null;
-    socketState.currentUser = null;
-  }
-}
-
-function handleSendMessage(socket, message, socketState) {
-  if (!socketState.currentRoom || !socketState.currentUser) return;
-  
-  if (message.roomCode === socketState.currentRoom) {
-    const senderDisplayName = getUserDisplayName(message);
     
-    updateUserStatus(socketState.currentRoom, senderDisplayName, "activo");
-    
-    if (socketState.typingTimeout) {
-      clearTimeout(socketState.typingTimeout);
-      socketState.typingTimeout = null;
+    if (socketState.currentRoom === roomCode) {
+      socketState.currentRoom = null;
+      socketState.currentUser = null;
     }
-    
-    const room = rooms.get(socketState.currentRoom);
-    if (room && room.users.has(senderDisplayName)) {
-      room.users.get(senderDisplayName).typing = false;
-      broadcastTypingStatus(socketState.currentRoom, senderDisplayName, false);
-    }
-    
-    const { messageId, timestamp, formattedMessage } = createChatMessage(
-      socketState.currentRoom, 
-      senderDisplayName, 
-      message.message
-    );
-    
-    broadcastToRoom(socketState.currentRoom, {
-      type: 'message',
-      id: messageId,
-      roomCode: socketState.currentRoom,
-      sender: senderDisplayName,
-      timestamp,
-      status: MESSAGE_STATUS.DELIVERED,
-      message: formattedMessage
-    });
-  }
-}
+  });
 
-function handleTypingStatus(socket, message, isTyping, socketState) {
-  if (!socketState.currentRoom || !socketState.currentUser) return;
-  
-  const roomCode = message.roomCode;
-  const displayName = getUserDisplayName(message);
-  
-  if (rooms.has(roomCode)) {
-    const room = rooms.get(roomCode);
-    if (room.users.has(displayName)) {
-      const userInfo = room.users.get(displayName);
-      userInfo.typing = isTyping;
-      userInfo.lastActivity = Date.now();
-      
-      if (isTyping) {
+  // Eventos de escritura
+  socket.on('typing', (message) => {
+    if (!socketState.currentRoom || !socketState.currentUser) return;
+    
+    const roomCode = message.roomCode;
+    const displayName = getUserDisplayName(message);
+    
+    if (rooms.has(roomCode)) {
+      const room = rooms.get(roomCode);
+      if (room.users.has(displayName)) {
+        const userInfo = room.users.get(displayName);
+        userInfo.typing = true;
+        userInfo.lastActivity = Date.now();
+        
         if (socketState.typingTimeout) {
           clearTimeout(socketState.typingTimeout);
         }
@@ -480,65 +493,65 @@ function handleTypingStatus(socket, message, isTyping, socketState) {
         socketState.typingTimeout = setTimeout(() => {
           if (rooms.has(roomCode) && room.users.has(displayName)) {
             room.users.get(displayName).typing = false;
-            broadcastTypingStatus(roomCode, displayName, false);
+            io.to(roomCode).emit('typingStatus', {
+              roomCode,
+              userName: displayName,
+              isTyping: false
+            });
           }
           socketState.typingTimeout = null;
         }, 3000);
-      } else if (socketState.typingTimeout) {
-        clearTimeout(socketState.typingTimeout);
-        socketState.typingTimeout = null;
+        
+        io.to(roomCode).emit('typingStatus', {
+          roomCode,
+          userName: displayName,
+          isTyping: true
+        });
       }
-      
-      broadcastTypingStatus(roomCode, displayName, isTyping);
-    }
-  }
-}
-
-function handleUpdateStatus(socket, message, socketState) {
-  if (!socketState.currentRoom || !socketState.currentUser) return;
-  
-  const roomCode = message.roomCode;
-  const displayName = getUserDisplayName(message);
-  const status = message.status || "activo";
-  
-  updateUserStatus(roomCode, displayName, status);
-  updateUserList(roomCode);
-}
-
-function setupSocketHandlers(socket) {
-  const socketState = {
-    currentRoom: null,
-    currentUser: null,
-    typingTimeout: null
-  };
-  
-  socket.on('message', (message) => {
-    try {
-      const parsedMessage = JSON.parse(message);
-      console.log("Mensaje recibido:", parsedMessage.type);
-      
-      const handlers = {
-        'joinRoom': () => handleJoinRoom(socket, parsedMessage, socketState),
-        'sendMessage': () => handleSendMessage(socket, parsedMessage, socketState),
-        'leaveRoom': () => handleLeaveRoom(socket, parsedMessage, true, socketState),
-        'typing': () => handleTypingStatus(socket, parsedMessage, true, socketState),
-        'stopTyping': () => handleTypingStatus(socket, parsedMessage, false, socketState),
-        'updateStatus': () => handleUpdateStatus(socket, parsedMessage, socketState),
-        'messageRead': () => {}
-      };
-      
-      const handler = handlers[parsedMessage.type];
-      if (handler) {
-        handler();
-      } else {
-        console.log('Tipo de mensaje desconocido:', parsedMessage.type);
-      }
-    } catch (error) {
-      console.error('Error procesando mensaje:', error);
     }
   });
-  
-  socket.on('close', () => {
+
+  socket.on('stopTyping', (message) => {
+    if (!socketState.currentRoom || !socketState.currentUser) return;
+    
+    const roomCode = message.roomCode;
+    const displayName = getUserDisplayName(message);
+    
+    if (rooms.has(roomCode)) {
+      const room = rooms.get(roomCode);
+      if (room.users.has(displayName)) {
+        const userInfo = room.users.get(displayName);
+        userInfo.typing = false;
+        userInfo.lastActivity = Date.now();
+        
+        if (socketState.typingTimeout) {
+          clearTimeout(socketState.typingTimeout);
+          socketState.typingTimeout = null;
+        }
+        
+        io.to(roomCode).emit('typingStatus', {
+          roomCode,
+          userName: displayName,
+          isTyping: false
+        });
+      }
+    }
+  });
+
+  // Actualización de estado
+  socket.on('updateStatus', (message) => {
+    if (!socketState.currentRoom || !socketState.currentUser) return;
+    
+    const roomCode = message.roomCode;
+    const displayName = getUserDisplayName(message);
+    const status = message.status || "activo";
+    
+    updateUserStatus(roomCode, displayName, status);
+    updateUserList(roomCode);
+  });
+
+  // Evento de desconexión
+  socket.on('disconnect', () => {
     console.log('Cliente desconectado');
     
     if (socketState.currentRoom && socketState.currentUser) {
@@ -553,22 +566,31 @@ function setupSocketHandlers(socket) {
         }
       }, RECONNECTION_WINDOW + 1000);
       
-      handleLeaveRoom(socket, {
-        type: 'leaveRoom',
-        roomCode: socketState.currentRoom,
-        userName: socketState.currentUser,
-        displayName
-      }, false, socketState);
+      if (rooms.has(socketState.currentRoom)) {
+        const room = rooms.get(socketState.currentRoom);
+        
+        if (room.users.has(displayName)) {
+          const userInfo = room.users.get(displayName);
+          userInfo.connected = false;
+          userInfo.lastActivity = Date.now();
+          
+          if (roomParticipants.has(socketState.currentRoom) && roomParticipants.get(socketState.currentRoom).has(displayName)) {
+            const participant = roomParticipants.get(socketState.currentRoom).get(displayName);
+            participant.connected = false;
+            participant.status = "desconectado";
+            participant.lastSeen = Date.now();
+          }
+          
+          updateUserList(socketState.currentRoom);
+          cleanupEmptyRoom(socketState.currentRoom);
+        }
+      }
     }
   });
-  
-  return socketState;
-}
-
-wss.on('connection', (socket) => {
-  console.log('Cliente conectado');
-  setupSocketHandlers(socket);
 });
 
-console.log('Servidor WebSocket listo y esperando conexiones...');
-console.log('Presiona Ctrl+C para detener el servidor');
+// Iniciar servidor
+httpServer.listen(PORT, () => {
+  console.log(`Servidor Socket.IO listo y esperando conexiones en puerto ${PORT}`);
+  console.log('Presiona Ctrl+C para detener el servidor');
+});
